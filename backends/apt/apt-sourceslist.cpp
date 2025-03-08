@@ -61,9 +61,111 @@ SourcesList::SourceRecord *SourcesList::AddSourceNode(SourceRecord &rec)
     return newrec;
 }
 
-bool SourcesList::ReadSourcePart(string listpath)
+bool SourcesList::ReadSourceDeb822(string listpath)
 {
-    //cout << "SourcesList::ReadSourcePart() "<< listpath  << endl;
+    char buf[512];
+    const char *p;
+    const char *val;
+    ifstream ifs(listpath.c_str(), ios::in);
+    bool record_ok = true;
+    bool started = false;
+    SourceRecord rec = SourceRecord ();
+    rec.SourceFile = listpath;
+
+    // cannot open file
+    if (!ifs != 0) {
+        return _error->Error("Can't read %s", listpath.c_str());
+    }
+
+    while (ifs.eof() == false) {
+        p = buf;
+        ifs.getline(buf, sizeof(buf));
+
+        if (*p == '#') {
+            SourceRecord comment_rec = SourceRecord ();
+            comment_rec.SourceFile = listpath;
+            comment_rec.Type = Comment;
+            comment_rec.Comment = p;
+            AddSourceNode(comment_rec);
+            continue;
+        }
+
+        if (*p == '\r' || *p == '\n' || *p == 0) {
+            if (started) {
+                AddSourceNode(rec);
+                rec = SourceRecord ();
+                rec.SourceFile = listpath;
+                started = false;
+            }
+
+            continue;
+        }
+
+        val = strchr(p, ':');
+        if (!val)
+            return _error->Error("Syntax error in line %s", buf);
+
+        int key_len = (val - p) - 1;
+        val++;
+        while (isspace(*val)) {
+            val++;
+        }
+
+        if (strncmp (p, "Types", key_len) == 0) {
+            GStrv types = g_strsplit_set (val, " \t\n", -1);
+            for (int i = 0; types[i] != NULL; i++) {
+                if (*types[i] != 0) {
+                    if (!rec.SetType(types[i])) {
+                        _error->Error("Unknown type %s", types[i]);
+                        g_strfreev (types);
+                        return false;
+                    }
+                }
+            }
+
+            g_strfreev (types);
+        } else if (strncmp (p, "URIs", key_len) == 0) {
+            if (!rec.SetURI(val))
+                return _error->Error("Unable to assign URI %s", val);
+        } else if (strncmp (p, "Suites", key_len) == 0) {
+            rec.Dist = string(val);
+        } else if (strncmp (p, "Components", key_len) == 0) {
+            GStrv components = g_strsplit (val, " \t\n", -1);
+            rec.NumSections = 0;
+            for (int i = 0; components[i] != NULL; i++) {
+                if (*components[i] != 0) {
+                    rec.NumSections++;
+                }
+            }
+
+            rec.Sections = new string[rec.NumSections];
+            int section_i = 0;
+            for (int i = 0; components[i] != NULL; i++) {
+                if (*components[i] != 0) {
+                    rec.Sections[section_i++] = string(components[i]);
+                }
+            }
+
+            g_strfreev (components);
+        } else if (strncmp (p, "Enabled", key_len) == 0) {
+            if (strncmp (val, "no", 2) == 0)
+                rec.Type = Disabled;
+            else if (strncmp (val, "yes", 3) != 0)
+                return _error->Error("Unknown Enabled value %s (only 'yes' and 'no' are allowed)", val);
+        }
+
+        started = true;
+    }
+
+    if (started)
+        AddSourceNode(rec);
+
+    ifs.close();
+    return record_ok;
+}
+
+bool SourcesList::ReadSourceOneLine(string listpath)
+{
     char buf[512];
     const char *p;
     ifstream ifs(listpath.c_str(), ios::in);
@@ -176,6 +278,15 @@ bool SourcesList::ReadSourcePart(string listpath)
     return record_ok;
 }
 
+bool SourcesList::ReadSourcePart(string listpath)
+{
+    if (g_str_has_suffix (listpath.c_str(), ".sources")) {
+        return ReadSourceDeb822(listpath);
+    } else {
+        return ReadSourceOneLine(listpath);
+    }
+}
+
 bool SourcesList::ReadSourceDir(string Dir)
 {
     //cout << "SourcesList::ReadSourceDir() " << Dir  << endl;
@@ -204,7 +315,8 @@ bool SourcesList::ReadSourceDir(string Dir)
         }
 
         // Only look at files ending in .list to skip .rpmnew etc files
-        if (strcmp(Ent->d_name + strlen(Ent->d_name) - 5, ".list") != 0) {
+        if (!g_str_has_suffix (Ent->d_name, ".list") &&
+            !g_str_has_suffix (Ent->d_name, ".sources")) {
             continue;
         }
 

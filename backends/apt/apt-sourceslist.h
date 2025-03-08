@@ -96,6 +96,8 @@ public:
     SourceRecord *AddEmptySource();
     void RemoveSource(SourceRecord *&);
     void SwapSources( SourceRecord *&, SourceRecord *& );
+    bool ReadSourceDeb822(string listpath);
+    bool ReadSourceOneLine(string listpath);
     bool ReadSourcePart(string listpath);
     bool ReadSourceDir(string Dir);
     bool ReadSources();
