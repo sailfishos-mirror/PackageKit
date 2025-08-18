@@ -58,12 +58,11 @@ static void     pk_client_finalize	(GObject     *object);
 struct _PkClientPrivate
 {
 	GDBusConnection		*connection;
-	GPtrArray		*calls;
+	GPtrArray		*calls;  /* (element-type PkClientState) (owned) */
 	PkControl		*control;
 	gchar			*locale;
 	gboolean		 background;
 	gboolean		 interactive;
-	gboolean		 idle;
 	gboolean		 details_with_deps_size;
 	guint			 cache_age;
 };
@@ -164,7 +163,7 @@ struct _PkClientState
 	GCancellable			*cancellable_client;
 	GTask				*res;
 	PkBitfield			 filters;
-	PkClient			*client;
+	PkClient			*client;  /* (not nullable) (not owned) */
 	PkProgress			*progress;
 	PkResults			*results;
 	PkRoleEnum			 role;
@@ -173,6 +172,10 @@ struct _PkClientState
 	gint				 remaining_files_to_copy;
 	PkClientHelper			*client_helper;
 	gboolean			 waiting_for_finished;
+
+	/* True if this PkClientState represents a peek at a transaction which
+	 * it doesn’t own, rather than being the owner of the transaction: */
+	gboolean			 querying_progress;
 };
 
 G_DEFINE_TYPE (PkClientState, pk_client_state, G_TYPE_OBJECT)
@@ -198,16 +201,15 @@ static void
 pk_client_state_remove (PkClient *client, PkClientState *state)
 {
 	PkClientPrivate *priv = pk_client_get_instance_private (client);
-	gboolean is_idle;
+	gboolean was_removed, is_idle;
 
-	g_ptr_array_remove (priv->calls, state);
+	was_removed = g_ptr_array_remove_fast (priv->calls, state);
+	/* state may have been finalised after this point */
 
 	/* has the idle state changed? */
 	is_idle = (priv->calls->len == 0);
-	if (is_idle != priv->idle) {
-		priv->idle = is_idle;
+	if (was_removed && is_idle)
 		g_object_notify_by_pspec (G_OBJECT (client), obj_properties[PROP_IDLE]);
-	}
 }
 
 /*
@@ -218,11 +220,17 @@ pk_client_state_remove (PkClient *client, PkClientState *state)
 static void
 pk_client_state_finish (PkClientState *state, GError *error)
 {
+	g_autoptr(PkClientState) state_owned = g_object_ref (state);
+	g_autoptr(GError) error_owned = g_steal_pointer (&error);
+
 	if (state->res == NULL)
 		return;
 
+	/* Either have to have been successful, or have set an error */
+	g_assert (state->ret || error_owned != NULL);
+
 	/* force finished (if not already set) so clients can update the UI's */
-	if (state->progress != NULL) {
+	if (state->progress != NULL && !state->querying_progress) {
 		pk_progress_set_status (state->progress, PK_STATUS_ENUM_FINISHED);
 	}
 
@@ -230,10 +238,10 @@ pk_client_state_finish (PkClientState *state, GError *error)
 
 	if (state->ret) {
 		g_task_return_pointer (state->res,
-		                       g_object_ref (state->results),
+		                       state->querying_progress ? G_OBJECT (g_object_ref (state->progress)) : G_OBJECT (g_object_ref (state->results)),
 		                       g_object_unref);
 	} else {
-		g_task_return_error (state->res, error);
+		g_task_return_error (state->res, g_steal_pointer (&error_owned));
 	}
 
 	/* remove any socket file */
@@ -247,6 +255,7 @@ pk_client_state_finish (PkClientState *state, GError *error)
 
 	/* remove from list */
 	pk_client_state_remove (state->client, state);
+	/* `state_owned` may be the only strong ref to `state` remaining after this point */
 
 	/* mark the state as finished */
 	g_clear_object (&state->res);
@@ -290,7 +299,7 @@ pk_client_state_finalize (GObject *object)
 	g_clear_object (&state->results);
 	g_clear_object (&state->progress);
 	g_clear_object (&state->res);
-	g_object_unref (state->client);
+	state->client = NULL;
 
 	G_OBJECT_CLASS (pk_client_state_parent_class)->finalize (object);
 }
@@ -373,6 +382,8 @@ pk_client_cancellable_cancel_cb (GCancellable *cancellable,
 			   pk_client_cancel_cb, pk_client_weak_ref_new (state));
 }
 
+static void pk_client_state_add (PkClient *client, PkClientState *state);
+
 static PkClientState *
 pk_client_state_new (PkClient *client,
 		     GAsyncReadyCallback callback_ready,
@@ -387,7 +398,7 @@ pk_client_state_new (PkClient *client,
 	state->role = role;
 	state->cancellable = g_cancellable_new ();
 	state->res = g_task_new (client, state->cancellable, callback_ready, user_data);
-	state->client = g_object_ref (client);
+	state->client = client;
 	g_task_set_source_tag (state->res, source_tag);
 
 	if (cancellable != NULL) {
@@ -397,6 +408,9 @@ pk_client_state_new (PkClient *client,
 							       pk_client_weak_ref_new (state),
 							       pk_client_weak_ref_free);
 	}
+
+	/* track state */
+	pk_client_state_add (client, state);
 
 	return state;
 }
@@ -432,7 +446,7 @@ pk_client_get_property (GObject *object, guint prop_id, GValue *value, GParamSpe
 		g_value_set_boolean (value, priv->interactive);
 		break;
 	case PROP_IDLE:
-		g_value_set_boolean (value, priv->idle);
+		g_value_set_boolean (value, pk_client_get_idle (client));
 		break;
 	case PROP_CACHE_AGE:
 		g_value_set_uint (value, priv->cache_age);
@@ -777,16 +791,15 @@ static void
 pk_client_state_add (PkClient *client, PkClientState *state)
 {
 	PkClientPrivate *priv = pk_client_get_instance_private (client);
-	gboolean is_idle;
+	gboolean was_idle;
 
-	g_ptr_array_add (priv->calls, state);
+	was_idle = pk_client_get_idle (client);
+
+	g_ptr_array_add (priv->calls, g_object_ref (state));
 
 	/* has the idle state changed? */
-	is_idle = (priv->calls->len == 0);
-	if (is_idle != priv->idle) {
-		priv->idle = is_idle;
+	if (was_idle)
 		g_object_notify_by_pspec (G_OBJECT (client), obj_properties[PROP_IDLE]);
-	}
 }
 
 /*
@@ -884,10 +897,6 @@ pk_client_copy_finished_remove_old_files (PkClientState *state)
 
 	/* get the data */
 	array = pk_results_get_files_array (state->results);
-	if (array == NULL) {
-		g_warning ("internal error, no files in array");
-		return;
-	}
 
 	/* remove any without dest path */
 	for (i = 0; i < array->len; ) {
@@ -1003,6 +1012,8 @@ pk_client_copy_downloaded_file (PkClientState *state, const gchar *package_id, c
  * We have to copy the files from the temporary directory into the user-specified
  * directory. There should only be one file for each package, although this is
  * not encoded in the spec.
+ *
+ * This will eventually call pk_client_state_finish() on `state`.
  */
 static void
 pk_client_copy_downloaded (PkClientState *state)
@@ -1012,19 +1023,19 @@ pk_client_copy_downloaded (PkClientState *state)
 	guint len;
 	PkFiles *item;
 	g_autoptr(GPtrArray) array = NULL;
+	unsigned int n_files_to_copy;
 
 	/* get data */
 	array = pk_results_get_files_array (state->results);
-	if (array == NULL) {
-		g_warning ("internal error, no files in array");
-		return;
-	}
 
 	/* get the number of files to copy */
+	n_files_to_copy = 0;
 	for (i = 0; i < array->len; i++) {
 		item = g_ptr_array_index (array, i);
-		g_atomic_int_add (&state->remaining_files_to_copy, g_strv_length (pk_files_get_files (item)));
+		n_files_to_copy += g_strv_length (pk_files_get_files (item));
 	}
+
+	g_atomic_int_set (&state->remaining_files_to_copy, n_files_to_copy);
 
 	/* get a cached value, as pk_client_copy_downloaded_file() adds items */
 	len = array->len;
@@ -1042,6 +1053,12 @@ pk_client_copy_downloaded (PkClientState *state)
 							pk_files_get_package_id (item),
 							files[j]);
 		}
+	}
+
+	/* Were there actually any files to copy? */
+	if (n_files_to_copy == 0) {
+		state->ret = TRUE;
+		pk_client_state_finish (state, NULL);
 	}
 }
 
@@ -1081,7 +1098,8 @@ pk_client_signal_finished (PkClientState *state,
 		return;
 	}
 
-	/* do we have to copy results? */
+	/* do we have to copy results? If so, this will eventually call
+	 * pk_client_state_finish() for us. */
 	if (state->role == PK_ROLE_ENUM_DOWNLOAD_PACKAGES &&
 	    state->directory != NULL &&
 	    exit_enum != PK_EXIT_ENUM_CANCELLED) {
@@ -1168,13 +1186,16 @@ pk_client_signal_cb (GDBusProxy *proxy,
 		return;
 
 	if (g_strcmp0 (signal_name, "Finished") == 0) {
-		g_variant_get (parameters,
-			       "(uu)",
-			       &tmp_uint2,
-			       &tmp_uint);
-		pk_client_signal_finished (state,
-					   tmp_uint2,
-					   tmp_uint);
+		if (state->waiting_for_finished) {
+			g_variant_get (parameters,
+				       "(uu)",
+				       &tmp_uint2,
+				       &tmp_uint);
+			/* this will call pk_client_state_finish(): */
+			pk_client_signal_finished (state,
+						   tmp_uint2,
+						   tmp_uint);
+		}
 		return;
 	}
 	if (g_strcmp0 (signal_name, "Package") == 0) {
@@ -1587,9 +1608,8 @@ pk_client_method_cb (GObject *source_object,
 		return;
 	}
 
-	/* wait for ::Finished() or notify::g-name-owner (if the daemon disappears) */
+	/* wait for ::Finished() or ::Destroy() or notify::g-name-owner (if the daemon disappears) */
 	state->waiting_for_finished = TRUE;
-	g_object_ref (state);
 }
 
 /*
@@ -2229,9 +2249,6 @@ pk_client_get_proxy_cb (GObject *object,
 			   state->cancellable,
 			   pk_client_set_hints_cb,
 			   g_object_ref (state));
-
-	/* track state */
-	g_ptr_array_add (priv->calls, state);
 }
 
 /*
@@ -4162,9 +4179,6 @@ pk_client_adopt_async (PkClient *client,
 				  state->cancellable,
 				  pk_client_adopt_get_proxy_cb,
 				  g_object_ref (state));
-
-	/* track state */
-	pk_client_state_add (client, state);
 }
 
 /**********************************************************************/
@@ -4192,36 +4206,6 @@ pk_client_get_progress_finish (PkClient *client, GAsyncResult *res, GError **err
 }
 
 /*
- * pk_client_get_progress_state_finish:
- * @state: a #PkClientState
- * @error: (transfer full)
- **/
-static void
-pk_client_get_progress_state_finish (PkClientState *state, GError *error)
-{
-	if (state->cancellable_id > 0) {
-		g_cancellable_disconnect (state->cancellable_client,
-					  state->cancellable_id);
-		state->cancellable_id = 0;
-	}
-	g_clear_object (&state->cancellable);
-	g_clear_object (&state->cancellable_client);
-
-	pk_client_state_unset_proxy (state);
-
-	if (state->ret) {
-		g_task_return_pointer (state->res,
-		                       g_object_ref (state->progress),
-		                       g_object_unref);
-	} else {
-		g_task_return_error (state->res, g_steal_pointer (&error));
-	}
-
-	/* remove from list */
-	pk_client_state_remove (state->client, state);
-}
-
-/*
  * pk_client_get_progress_cb:
  **/
 static void
@@ -4234,7 +4218,7 @@ pk_client_get_progress_cb (GObject *source_object,
 
 	state->proxy = g_dbus_proxy_new_for_bus_finish (res, &error);
 	if (state->proxy == NULL) {
-		pk_client_get_progress_state_finish (state, g_steal_pointer (&error));
+		pk_client_state_finish (state, g_steal_pointer (&error));
 		return;
 	}
 
@@ -4242,7 +4226,7 @@ pk_client_get_progress_cb (GObject *source_object,
 	pk_client_proxy_connect (state);
 
 	state->ret = TRUE;
-	pk_client_get_progress_state_finish (state, NULL);
+	pk_client_state_finish (state, NULL);
 }
 
 /**
@@ -4275,6 +4259,7 @@ pk_client_get_progress_async (PkClient *client,
 	state = pk_client_state_new (client, callback_ready, user_data, pk_client_get_progress_async, PK_ROLE_ENUM_UNKNOWN, cancellable);
 	state->tid = g_strdup (transaction_id);
 	state->progress = pk_progress_new ();
+	state->querying_progress = TRUE;
 
 	/* check not already cancelled */
 	if (cancellable != NULL &&
@@ -4296,9 +4281,6 @@ pk_client_get_progress_async (PkClient *client,
 				  state->cancellable,
 				  pk_client_get_progress_cb,
 				  g_object_ref (state));
-
-	/* track state */
-	pk_client_state_add (client, state);
 }
 
 /**********************************************************************/
@@ -4312,10 +4294,12 @@ pk_client_cancel_all_dbus_methods (PkClient *client)
 	PkClientPrivate *priv = pk_client_get_instance_private (client);
 	const PkClientState *state;
 	guint i;
-	GPtrArray *array;
+	g_autoptr(GPtrArray) array = NULL;
 
-	/* just cancel the call */
-	array = priv->calls;
+	/* just cancel the call; cancelling is synchronous so this should result
+	 * in pk_client_state_remove() being called, which will modify the array,
+	 * so take a copy of the array first */
+	array = g_ptr_array_new_from_array (priv->calls->pdata, priv->calls->len, NULL, NULL, NULL);
 	for (i = 0; i < array->len; i++) {
 		state = g_ptr_array_index (array, i);
 		if (state->proxy == NULL)
@@ -4478,7 +4462,7 @@ pk_client_get_idle (PkClient *client)
 
 	g_return_val_if_fail (PK_IS_CLIENT (client), FALSE);
 
-	return priv->idle;
+	return (priv->calls->len == 0);
 }
 
 /**
@@ -4659,10 +4643,9 @@ pk_client_init (PkClient *client)
 	PkClientPrivate *priv = pk_client_get_instance_private (client);
 
 	client->priv = priv;
-	priv->calls = g_ptr_array_new ();
+	priv->calls = g_ptr_array_new_with_free_func ((GDestroyNotify) g_object_unref);
 	priv->background = FALSE;
 	priv->interactive = TRUE;
-	priv->idle = TRUE;
 	priv->cache_age = G_MAXUINT;
 	priv->details_with_deps_size = FALSE;
 
@@ -4682,11 +4665,13 @@ pk_client_finalize (GObject *object)
 	PkClient *client = PK_CLIENT (object);
 	PkClientPrivate *priv = pk_client_get_instance_private (client);
 
-	/* ensure we cancel any in-flight DBus calls */
+	/* ensure we cancel any in-flight D-Bus calls */
 	pk_client_cancel_all_dbus_methods (client);
 
 	g_clear_pointer (&priv->locale, g_free);
 	g_clear_object (&priv->control);
+
+	g_assert (priv->calls->len == 0);
 	g_clear_pointer (&priv->calls, g_ptr_array_unref);
 
 	G_OBJECT_CLASS (pk_client_parent_class)->finalize (object);

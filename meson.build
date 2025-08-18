@@ -11,7 +11,7 @@ pkg = import('pkgconfig')
 
 source_root = meson.project_source_root()
 
-glib_req_version = '2.62'
+glib_req_version = '2.76'
 glib_req = '>= @0@'.format(glib_req_version)
 glib_major = glib_req_version.split('.')[0].to_int()
 glib_minor = glib_req_version.split('.')[1].to_int()
@@ -22,10 +22,7 @@ gio_dep = dependency('gio-2.0', version: glib_req)
 gio_unix_dep = dependency('gio-unix-2.0', version: glib_req)
 gmodule_dep = dependency('gmodule-2.0', version: glib_req)
 sqlite3_dep = dependency('sqlite3')
-polkit_dep = dependency('polkit-gobject-1', version: '>=0.98')
-if polkit_dep.version().version_compare('>=0.114')
-  add_project_arguments ('-DHAVE_POLKIT_0_114=1', language: 'c')
-endif
+polkit_dep = dependency('polkit-gobject-1', version: '>=0.114')
 
 libsystemd = []
 if get_option('systemd')
